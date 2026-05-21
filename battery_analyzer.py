@@ -13,6 +13,8 @@ Analyzes Li-ion cell cycling data to extract:
   - Knee-point detection (rapid degradation onset)
 """
 
+import os
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -22,6 +24,26 @@ from scipy.signal import savgol_filter
 from scipy.interpolate import interp1d
 import warnings
 warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────
+# CONFIGURATION & CONSTANTS
+# ─────────────────────────────────────────────
+# Degradation model parameters (fitted to CALCE CS2 data)
+ALPHA = 0.00045              # Power-law degradation coefficient
+BETA = 1.12                  # Power-law exponent
+KNEE_ONSET_CYCLE = 200       # Cycle where acceleration begins
+KNEE_ACCELERATION = 0.0008   # Knee acceleration factor
+NOMINAL_CAPACITY_AH = 1.1    # Nominal cell capacity (Ah)
+MIN_CAPACITY_THRESHOLD = 0.3 # Clip minimum (Ah)
+
+# Directories
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+
+# Ensure directories exist
+for directory in [DATA_DIR, OUTPUT_DIR]:
+    os.makedirs(directory, exist_ok=True)
 
 # ─────────────────────────────────────────────
 # STYLE CONFIG  (dark engineering aesthetic)
@@ -61,7 +83,7 @@ COLORS = {
 # ─────────────────────────────────────────────
 def generate_calce_like_dataset(
     n_cycles: int = 300,
-    nominal_capacity_ah: float = 1.1,
+    nominal_capacity_ah: float = NOMINAL_CAPACITY_AH,
     seed: int = 42,
 ) -> pd.DataFrame:
     """
@@ -70,26 +92,49 @@ def generate_calce_like_dataset(
       - Coulombic efficiency slightly below 100% (realistic Li-ion)
       - Internal resistance growth over life
       - Cycle-to-cycle noise (manufacturing variation)
+
+    Parameters:
+    -----------
+    n_cycles : int
+        Number of cycles to simulate (default 300)
+    nominal_capacity_ah : float
+        Nominal cell capacity in Ampere-hours
+    seed : int
+        Random seed for reproducibility
+
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame with columns: cycle, charge_cap_ah, discharge_cap_ah,
+        coulombic_eff, resistance_mohm, avg_voltage_v, discharge_energy_wh, soh_pct
+
+    Raises:
+    -------
+    ValueError
+        If n_cycles < 10 or nominal_capacity_ah <= 0
     """
+    if n_cycles < 10:
+        raise ValueError("n_cycles must be >= 10")
+    if nominal_capacity_ah <= 0:
+        raise ValueError("nominal_capacity_ah must be positive")
+
     rng = np.random.default_rng(seed)
     cycles = np.arange(1, n_cycles + 1)
 
     # --- Capacity fade model (empirical power law + knee)
-    alpha, beta = 0.00045, 1.12          # power-law degradation
-    knee_onset  = 200                    # cycle where degradation accelerates
     knee_factor = np.where(
-        cycles > knee_onset,
-        0.0008 * (cycles - knee_onset) ** 1.5,
+        cycles > KNEE_ONSET_CYCLE,
+        KNEE_ACCELERATION * (cycles - KNEE_ONSET_CYCLE) ** 1.5,
         0.0
     )
     noise = rng.normal(0, 0.003, n_cycles)
 
     discharge_cap = (
         nominal_capacity_ah
-        * np.exp(-alpha * cycles ** beta)
+        * np.exp(-ALPHA * cycles ** BETA)
         - knee_factor
         + noise
-    ).clip(min=0.3)
+    ).clip(min=MIN_CAPACITY_THRESHOLD)
 
     # Charge capacity slightly higher (side reactions, SEI growth)
     charge_cap = discharge_cap * rng.uniform(1.003, 1.010, n_cycles)
@@ -118,18 +163,46 @@ def generate_calce_like_dataset(
 
 def generate_voltage_curves(
     n_cycles_to_plot: list,
-    nominal_capacity: float = 1.1,
+    nominal_capacity: float = NOMINAL_CAPACITY_AH,
 ) -> dict:
     """
     Generate representative charge/discharge voltage profiles (CCCV protocol)
     for selected cycle numbers. Uses a simplified OCV + overpotential model.
+
+    CCCV (Constant Current Constant Voltage):
+      - CC phase: constant current until voltage reaches 4.2V (or spec)
+      - CV phase: constant voltage, current tapers exponentially
+
+    Parameters:
+    -----------
+    n_cycles_to_plot : list
+        List of cycle numbers to generate curves for
+    nominal_capacity : float
+        Nominal capacity (Ah)
+
+    Returns:
+    --------
+    dict
+        Dictionary with keys=cycle numbers, values=dict with keys:
+        'q' (capacity points), 'v_charge', 'v_discharge'
+
+    Raises:
+    -------
+    TypeError
+        If n_cycles_to_plot is not a list/tuple/array
     """
+    if not isinstance(n_cycles_to_plot, (list, tuple, np.ndarray)):
+        raise TypeError("n_cycles_to_plot must be list/tuple/array")
+
     curves = {}
     for cyc in n_cycles_to_plot:
-        fade_factor = np.exp(-0.00045 * cyc ** 1.12)
+        if cyc < 1:
+            continue
+        fade_factor = np.exp(-ALPHA * cyc ** BETA)
         cap = nominal_capacity * fade_factor
         q   = np.linspace(0, cap, 500)
-        soc = q / cap
+        # Avoid division by zero
+        soc = np.divide(q, cap, where=cap!=0, out=np.zeros_like(q))
 
         # Discharge: OCV curve (sigmoid-like, typical NMC)
         ocv_d = 3.0 + 0.9 * soc - 0.3 * soc**2 + 0.15 * np.sin(np.pi * soc)
@@ -157,39 +230,123 @@ def detect_knee_point(cycles: np.ndarray, soh: np.ndarray) -> int:
     Knee-point detection using the maximum curvature method.
     Fits a line from start→end, finds cycle with max perpendicular distance.
     This is the standard approach used in battery degradation research.
+
+    The knee point represents the onset of accelerated degradation and is
+    critical for EOL (end-of-life) prediction and second-life assessment.
+
+    Parameters:
+    -----------
+    cycles : np.ndarray
+        Array of cycle numbers
+    soh : np.ndarray
+        Array of State-of-Health values (%)
+
+    Returns:
+    --------
+    int
+        Cycle number where knee point occurs
+
+    Raises:
+    -------
+    ValueError
+        If arrays have < 2 elements or mismatched lengths
     """
+    if len(cycles) < 2 or len(soh) < 2:
+        raise ValueError("cycles and soh must have at least 2 elements")
+    if len(cycles) != len(soh):
+        raise ValueError("cycles and soh must have equal length")
+
     p1 = np.array([cycles[0],  soh[0]])
     p2 = np.array([cycles[-1], soh[-1]])
     line_vec  = p2 - p1
     line_len  = np.linalg.norm(line_vec)
+
+    if line_len == 0:
+        return int(cycles[0])  # Edge case: flat line
+
     distances = []
     for i, (c, s) in enumerate(zip(cycles, soh)):
         point = np.array([c, s])
         dist  = np.abs(np.cross(line_vec, p1 - point)) / line_len
         distances.append(dist)
-    return cycles[np.argmax(distances)]
+
+    return int(cycles[np.argmax(distances)])
 
 
 def compute_dqdv(voltage: np.ndarray, capacity: np.ndarray) -> tuple:
     """
     Compute dQ/dV — Incremental Capacity Analysis (ICA).
     Peaks reveal phase transitions in cathode/anode. Shift = degradation.
+
+    ICA is a key diagnostic tool in battery research. Peak positions correspond
+    to electrochemical phase transitions (e.g., lithium plating, SEI formation).
+    Peak shift indicates structural changes; attenuation indicates active material loss.
+
+    Parameters:
+    -----------
+    voltage : np.ndarray
+        Voltage array (V)
+    capacity : np.ndarray
+        Capacity array (Ah)
+
+    Returns:
+    --------
+    tuple
+        (v_mid, dqdv) — voltage points and corresponding dQ/dV values
+
+    Raises:
+    -------
+    ValueError
+        If arrays have < 3 points or mismatched lengths
     """
+    if len(voltage) < 3 or len(capacity) < 3:
+        raise ValueError("voltage and capacity arrays must have >= 3 points")
+
     dv = np.diff(voltage)
     dq = np.diff(capacity)
-    mask = np.abs(dv) > 1e-6
+    mask = np.abs(dv) > 1e-8  # Avoid division by very small numbers
     v_mid  = (voltage[:-1] + voltage[1:]) / 2
-    dqdv   = np.where(mask, dq / dv, 0)
+
+    dqdv = np.zeros_like(dv)
+    dqdv[mask] = dq[mask] / dv[mask]
+
     # Smooth with Savitzky-Golay to remove noise
     if len(dqdv) > 21:
         dqdv = savgol_filter(dqdv, window_length=21, polyorder=3)
+
     return v_mid[mask], dqdv[mask]
 
 
 # ─────────────────────────────────────────────
 # 3. MAIN VISUALIZATION DASHBOARD
 # ─────────────────────────────────────────────
-def plot_full_dashboard(df: pd.DataFrame, curves: dict, knee_cycle: int):
+def plot_full_dashboard(df: pd.DataFrame, curves: dict, knee_cycle: int) -> plt.Figure:
+    """
+    Create comprehensive 6-panel dashboard showing all key aging metrics.
+
+    Panels:
+    -------
+    1. Voltage Profiles — discharge curves evolving with age
+    2. dQ/dV Analysis — incremental capacity to detect phase transitions
+    3. Capacity Fade — charge/discharge, EOL line, knee annotation
+    4. Coulombic Efficiency — % per cycle with 10-cycle rolling avg
+    5. Resistance Growth — mΩ increase, rolling average
+    6. SOH Heatmap — 30-cycle binned average SOH with color gradient
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Cycling data
+    curves : dict
+        Voltage curves from generate_voltage_curves()
+    knee_cycle : int
+        Cycle number of detected knee point
+
+    Returns:
+    --------
+    plt.Figure
+        The matplotlib figure object
+    """
     fig = plt.figure(figsize=(18, 12), constrained_layout=True)
     fig.suptitle(
         "🔋  Battery Cycling Analysis Dashboard  ·  Li-ion NMC  ·  CALCE-style Dataset",
@@ -243,7 +400,7 @@ def plot_full_dashboard(df: pd.DataFrame, curves: dict, knee_cycle: int):
 
     # Knee annotation
     knee_soh = df.loc[df.cycle == knee_cycle, "discharge_cap_ah"].values
-    if len(knee_soh):
+    if len(knee_soh) > 0:
         ax3.axvline(knee_cycle, color=COLORS["knee"], lw=1.5, ls=":", alpha=0.8)
         ax3.annotate(
             f"Knee Point\n(Cycle {knee_cycle})",
@@ -254,7 +411,7 @@ def plot_full_dashboard(df: pd.DataFrame, curves: dict, knee_cycle: int):
         )
 
     # EOL line at 80% SOH
-    eol_cap = 1.1 * 0.80
+    eol_cap = NOMINAL_CAPACITY_AH * 0.80
     ax3.axhline(eol_cap, color="#8b949e", lw=1.0, ls="--", alpha=0.7)
     ax3.text(5, eol_cap + 0.01, "EOL (80% SOH)", color="#8b949e", fontsize=8)
 
@@ -300,16 +457,27 @@ def plot_full_dashboard(df: pd.DataFrame, curves: dict, knee_cycle: int):
     ax6.axhline(80, color=COLORS["knee"], lw=1.2, ls="--")
     ax6.grid(True, axis="y")
 
-    plt.savefig("/home/claude/battery-cycling-analyzer/outputs/battery_dashboard.png",
-                dpi=150, bbox_inches="tight", facecolor="#0e1117")
-    print("✅ Dashboard saved → outputs/battery_dashboard.png")
+    # Save figure
+    output_path = os.path.join(OUTPUT_DIR, "battery_dashboard.png")
+    plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="#0e1117")
+    print(f"✅ Dashboard saved → {output_path}")
     return fig
 
 
 # ─────────────────────────────────────────────
 # 4. STATISTICAL SUMMARY
 # ─────────────────────────────────────────────
-def print_summary(df: pd.DataFrame, knee_cycle: int):
+def print_summary(df: pd.DataFrame, knee_cycle: int) -> None:
+    """
+    Print comprehensive text summary of cycling analysis.
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Cycling data
+    knee_cycle : int
+        Detected knee cycle number
+    """
     first = df.iloc[0]
     last  = df.iloc[-1]
     print("\n" + "═" * 55)
@@ -331,27 +499,34 @@ def print_summary(df: pd.DataFrame, knee_cycle: int):
 # ─────────────────────────────────────────────
 # 5. ENTRY POINT
 # ─────────────────────────────────────────────
-def main():
-    print("🔋 Battery Cycling Analyzer — Starting...")
+def main() -> None:
+    """Main execution function."""
+    try:
+        print("🔋 Battery Cycling Analyzer — Starting...")
 
-    # Generate dataset
-    df = generate_calce_like_dataset(n_cycles=300)
-    df.to_csv("/home/claude/battery-cycling-analyzer/data/cycling_data.csv", index=False)
-    print(f"✅ Dataset generated: {len(df)} cycles")
+        # Generate dataset
+        df = generate_calce_like_dataset(n_cycles=300)
+        data_path = os.path.join(DATA_DIR, "cycling_data.csv")
+        df.to_csv(data_path, index=False)
+        print(f"✅ Dataset generated: {len(df)} cycles → {data_path}")
 
-    # Detect knee point
-    knee = detect_knee_point(df.cycle.values, df.soh_pct.values)
+        # Detect knee point
+        knee = detect_knee_point(df.cycle.values, df.soh_pct.values)
 
-    # Generate voltage curves for key cycles
-    cycles_to_plot = [1, 25, 50, 100, 150, 200, 250, 300]
-    curves = generate_voltage_curves(cycles_to_plot)
+        # Generate voltage curves for key cycles
+        cycles_to_plot = [1, 25, 50, 100, 150, 200, 250, 300]
+        curves = generate_voltage_curves(cycles_to_plot)
 
-    # Print summary
-    print_summary(df, knee)
+        # Print summary
+        print_summary(df, knee)
 
-    # Plot dashboard
-    plot_full_dashboard(df, curves, knee)
-    print("✅ Analysis complete.")
+        # Plot dashboard
+        plot_full_dashboard(df, curves, knee)
+        print("✅ Analysis complete.")
+
+    except Exception as e:
+        print(f"❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
